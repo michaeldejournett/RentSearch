@@ -10,6 +10,7 @@ from typing import Callable, Optional
 
 MAX_LISTINGS_PER_BATCH = 5
 MAX_TEXT_PER_LISTING = 6000  # chars sent to LLM per listing
+MAX_FILTER_BATCH = 10        # listings per relevance-filter call
 
 
 def _call_llm(
@@ -75,7 +76,14 @@ def parse_json_response(text: str) -> object:
 def _build_extraction_prompt(batch: list[dict]) -> str:
     parts = []
     for i, listing in enumerate(batch, 1):
-        text_source = listing.get("page_text") or listing.get("body") or ""
+        snippet = listing.get("body") or ""
+        page = listing.get("page_text") or ""
+        # Always include the DDG snippet — it often has price/location in the first sentence.
+        # Prepend it to the scraped page text so the LLM sees both sources.
+        if snippet and page:
+            text_source = f"[Search snippet]: {snippet}\n[Page text]: {page}"
+        else:
+            text_source = snippet or page
         text_source = text_source[:MAX_TEXT_PER_LISTING]
         confidence = "high" if listing.get("scraped") else "low"
         parts.append(
@@ -97,11 +105,15 @@ Rules:
 - bedrooms: 0 for studio, integer, null if unknown
 - extraction_confidence: "high" if full page text provided, "medium" if partial, "low" if snippet only
 - address: MUST be a real street address (e.g. "123 Main St, Denver, CO 80203") — do NOT use the listing title, description text, or any non-address string; use null if no real address is found
+- apartment_name: branded name of the complex/building if mentioned (e.g. "Lux96", "The Meadows at Oak Park"), null if not found
+
+If the text clearly shows a SEARCH RESULTS PAGE or LIST PAGE (multiple apartments, pagination, "X results found", etc.):
+- Extract data for the FIRST / MOST PROMINENT individual unit described
+- Set extraction_confidence to "low"
+- Do NOT blend data from multiple units
 
 Each object must have these exact keys:
   apartment_name, address, price_monthly, bedrooms, bathrooms, sqft, available_date, summary, extraction_confidence
-
-- apartment_name: branded name of the complex/building if mentioned (e.g. "Lux96", "The Meadows at Oak Park"), null if not found
 
 {listings_block}
 
@@ -109,7 +121,12 @@ Return ONLY the JSON array, no explanation."""
 
 
 def _build_scoring_prompt(listing: dict, criteria: list[dict]) -> str:
-    text = listing.get("page_text") or listing.get("body") or ""
+    snippet = listing.get("body") or ""
+    page = listing.get("page_text") or ""
+    if snippet and page:
+        text = f"[Search snippet]: {snippet}\n[Page text]: {page}"
+    else:
+        text = snippet or page
     text = text[:MAX_TEXT_PER_LISTING]
     summary = listing.get("extracted", {}).get("summary", "")
 
@@ -208,6 +225,108 @@ def _score_listing(
             ],
             "overall_summary": "",
         }
+
+
+def _build_filter_prompt(
+    batch: list[dict],
+    city: str,
+    min_price: int,
+    max_price: int,
+    min_beds: int,
+    max_beds: int,
+) -> str:
+    parts = []
+    for i, listing in enumerate(batch, 1):
+        text = (listing.get("page_text") or listing.get("body") or "")[:800]
+        parts.append(
+            f"Listing {i}:\n"
+            f"Title: {listing.get('title', '')}\n"
+            f"URL: {listing.get('href', '')}\n"
+            f"Text: {text}\n"
+        )
+    listings_block = "\n---\n".join(parts)
+    n = len(batch)
+    if min_beds == 0 and max_beds == 0:
+        beds_desc = "studio"
+    elif min_beds == max_beds:
+        beds_desc = f"{min_beds} bedroom"
+    else:
+        beds_desc = f"{min_beds}–{max_beds} bedrooms"
+
+    return f"""You are a filter for an apartment search tool. Determine if each listing is a relevant long-term rental.
+
+Search criteria:
+- City/area: {city or 'anywhere in the US'}
+- Price: ${min_price}–${max_price}/month
+- Bedrooms: {beds_desc}
+
+Mark a listing RELEVANT if it appears to be a long-term residential rental (month-to-month or annual lease) that:
+1. Is in or near the target city/area (or the location is unclear from the text)
+2. Is plausibly within the price range (or price is not mentioned)
+
+Mark a listing IRRELEVANT only if it is clearly:
+- A vacation/short-term/nightly rental (Airbnb, VRBO, hotel, etc.)
+- A property for sale (not for rent)
+- In the wrong country or a clearly different city/region
+- Not a residential rental at all (news article, forum post, advertisement, etc.)
+- Clearly outside the price range (e.g. $10,000/mo when searching $1,000–$2,000)
+
+When in doubt, mark RELEVANT.
+
+{listings_block}
+
+Return ONLY a JSON array of exactly {n} objects:
+[{{"idx": 1, "relevant": true}}, {{"idx": 2, "relevant": false}}, ...]"""
+
+
+def filter_irrelevant_listings(
+    listings: list[dict],
+    city: str,
+    min_price: int,
+    max_price: int,
+    min_beds: int,
+    max_beds: int,
+    api_key: str,
+    model: str,
+    base_url: str = "",
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+) -> list[dict]:
+    """Drop obviously irrelevant listings before extraction/scoring.
+
+    Uses a fast batch LLM call per group of listings to check whether each
+    is a long-term rental in the right location/price range.  Falls back to
+    returning the full input list on any error so the pipeline never stalls.
+    """
+    if not api_key or not model or not listings:
+        return listings
+
+    kept: list[dict] = []
+    total = len(listings)
+
+    for batch_start in range(0, total, MAX_FILTER_BATCH):
+        batch = listings[batch_start: batch_start + MAX_FILTER_BATCH]
+        if progress_callback:
+            frac = 0.56 + (batch_start / max(total, 1)) * 0.04
+            progress_callback(
+                frac,
+                f"Checking relevance of listings {batch_start + 1}–"
+                f"{batch_start + len(batch)} of {total}...",
+            )
+        try:
+            prompt = _build_filter_prompt(batch, city, min_price, max_price, min_beds, max_beds)
+            raw = _call_llm(model, prompt, api_key, base_url, max_tokens=512)
+            data = parse_json_response(raw)
+            if isinstance(data, list) and len(data) == len(batch):
+                for listing, item in zip(batch, data):
+                    if not isinstance(item, dict) or item.get("relevant") is not False:
+                        kept.append(listing)
+            else:
+                kept.extend(batch)  # malformed response — keep all
+        except Exception:  # noqa: BLE001
+            kept.extend(batch)  # any error — keep all
+
+    # Never return an empty list; fall back to the full input
+    return kept if kept else listings
 
 
 def analyze_listings_batch(

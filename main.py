@@ -10,6 +10,7 @@ Build Linux:  flet build linux
 
 import flet as ft
 
+from pages.history_page import history_page
 from pages.results_page import results_page
 from pages.search_page import search_page
 from pages.settings_page import settings_page  # rebuilt on each visit
@@ -17,10 +18,11 @@ from src.config import has_api_key
 from src import state
 
 
-NAV_ROUTES = ["/search", "/results", "/settings"]
+NAV_ROUTES = ["/search", "/results", "/history", "/settings"]
 NAV_ICONS = [
     (ft.Icons.SEARCH_OUTLINED, ft.Icons.SEARCH, "Search"),
     (ft.Icons.LIST_ALT_OUTLINED, ft.Icons.LIST_ALT, "Results"),
+    (ft.Icons.HISTORY_OUTLINED, ft.Icons.HISTORY, "History"),
     (ft.Icons.SETTINGS_OUTLINED, ft.Icons.SETTINGS, "Settings"),
 ]
 
@@ -44,7 +46,7 @@ def main(page: ft.Page):
 
     # ── build search content once (preserves form state) ────────────────────
     search_content = search_page(page)
-    # settings and results are rebuilt on each visit
+    # settings, results, and history are rebuilt on each visit
 
     # ── custom bottom nav ────────────────────────────────────────────────────
     nav_items: list[ft.Container] = []
@@ -103,7 +105,15 @@ def main(page: ft.Page):
             content_area.content = results_page(page)
         elif route == "/settings":
             content_area.content = settings_page(page)
-        else:
+        elif route == "/history":
+            content_area.content = history_page(page)
+        else:  # /search
+            # If a prefill was requested (e.g. from History "Re-run"), rebuild
+            # the search form with those parameters and consume the prefill.
+            prefill = state.get("search_prefill")
+            if prefill:
+                state.set("search_prefill", None)
+                search_content = search_page(page, prefill=prefill)
             content_area.content = search_content
 
         _rebuild_nav()

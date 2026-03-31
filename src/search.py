@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from ddgs import DDGS
 from ddgs.exceptions import RatelimitException
 
-MAX_RESULTS_PER_QUERY = 12
+MAX_RESULTS_PER_QUERY = 20
 SCRAPE_TIMEOUT = 10
 SCRAPE_DELAY = 0.6
 
@@ -141,8 +141,13 @@ def _ddg_search(query: str, max_results: int) -> list[dict]:
 
 
 def _extract_page_text(html: str) -> Optional[str]:
-    """Extract cleaned body text from an HTML string."""
+    """Extract cleaned body text from an HTML string.
+    Prepends the <title> tag so sub-pages carry the complex name as context.
+    """
     soup = BeautifulSoup(html, "lxml")
+    title_tag = soup.find("title")
+    title = title_tag.get_text(strip=True) if title_tag else ""
+
     for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
         tag.decompose()
     body = (
@@ -154,27 +159,30 @@ def _extract_page_text(html: str) -> Optional[str]:
     )
     if not body:
         return None
-    return " ".join(body.get_text(separator=" ").split())
+    body_text = " ".join(body.get_text(separator=" ").split())
+    return f"[Page title: {title}]\n{body_text}" if title else body_text
 
 
-def _find_subpage_links(html: str, base_url: str, max_links: int = 3) -> list[str]:
-    """Return URLs that are sub-pages of base_url's path (one level deeper, same domain).
-    Prioritises pages whose path/text suggests rental detail content.
+def _find_subpage_links(
+    html: str,
+    base_url: str,
+    max_links: int = 3,
+    api_key: str = "",
+    model: str = "",
+    llm_base_url: str = "",
+) -> list[str]:
+    """Return sub-page URLs of base_url that are likely to contain pricing/availability detail.
+    Uses the LLM to select the most useful sub-pages when an API key is available.
     """
-    _SUBPAGE_KEYWORDS = {
-        "floor", "plan", "amenity", "amenities", "detail", "unit",
-        "feature", "overview", "lease", "available", "photo", "gallery",
-    }
     try:
         parsed_base = urlparse(base_url)
         base_host = parsed_base.netloc.lower()
         base_path = parsed_base.path.rstrip("/")
+        base_depth = len([p for p in base_path.split("/") if p])
 
         soup = BeautifulSoup(html, "lxml")
-        candidates: list[str] = []
+        candidates: list[tuple[str, str]] = []
         seen: set[str] = set()
-
-        base_depth = len([p for p in base_path.split("/") if p])
 
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
@@ -188,23 +196,47 @@ def _find_subpage_links(html: str, base_url: str, max_links: int = 3) -> list[st
             path = parsed.path.rstrip("/")
             if path == base_path:
                 continue
-            # Must be deeper than the current page
             depth = len([p for p in path.split("/") if p])
             if depth <= base_depth:
                 continue
-            # Skip navigation/utility pages
             if any(path.lower().startswith(skip) for skip in _NAV_SKIP):
                 continue
             norm = path.lower()
             if norm in seen:
                 continue
             seen.add(norm)
-            # Only follow if path or anchor text matches a listing-detail keyword
-            text_hint = (a.get_text() + path).lower()
-            if any(kw in text_hint for kw in _SUBPAGE_KEYWORDS):
-                candidates.insert(0, href)
+            candidates.append((href, a.get_text(strip=True)[:80]))
 
-        return candidates[:max_links]
+        if not candidates:
+            return []
+
+        if not api_key or not model:
+            return [url for url, _ in candidates[:max_links]]
+
+        try:
+            from .analyzer import _call_llm, parse_json_response  # noqa: PLC0415
+        except ImportError:
+            return [url for url, _ in candidates[:max_links]]
+
+        lines = "\n".join(
+            f'{i + 1}. {url} | "{text}"'
+            for i, (url, text) in enumerate(candidates[:20])
+        )
+        prompt = (
+            f"I scraped an apartment complex page at: {base_url}\n"
+            f"These sub-pages were found:\n{lines}\n\n"
+            f"Pick up to {max_links} sub-pages most likely to contain floor plan pricing, "
+            "unit availability, or lease details. Exclude navigation, contact, blog, "
+            "and photo gallery pages.\n"
+            "Return ONLY a JSON array of URLs, e.g. "
+            '["https://example.com/floor-plans", "https://example.com/availability"]'
+        )
+        raw = _call_llm(model, prompt, api_key, llm_base_url, max_tokens=300)
+        data = parse_json_response(raw)
+        if isinstance(data, list):
+            valid = [u for u in data if isinstance(u, str) and u.startswith("http")]
+            return valid[:max_links]
+        return [url for url, _ in candidates[:max_links]]
     except Exception:  # noqa: BLE001
         return []
 
@@ -257,7 +289,13 @@ def scrape_page(url: str) -> Optional[str]:
         return None
 
 
-def scrape_listing_deep(url: str, max_subpages: int = 3) -> Optional[str]:
+def scrape_listing_deep(
+    url: str,
+    max_subpages: int = 3,
+    api_key: str = "",
+    model: str = "",
+    llm_base_url: str = "",
+) -> Optional[str]:
     """Scrape an individual listing page and up to max_subpages sub-pages
     (floor plans, amenities, etc.) to gather as much detail as possible.
     Returns combined text, or None if the main page fails.
@@ -277,9 +315,11 @@ def scrape_listing_deep(url: str, max_subpages: int = 3) -> Optional[str]:
         return None
 
     _scrape_log(url, "OK", f"{len(main_text)} chars")
-    parts = [main_text[:4000]]  # reserve room for sub-page text
+    sections = [f"=== Main page ({url}) ===\n{main_text[:4000]}"]
 
-    subpage_urls = _find_subpage_links(html, url, max_links=max_subpages)
+    subpage_urls = _find_subpage_links(html, url, max_links=max_subpages,
+                                        api_key=api_key, model=model,
+                                        llm_base_url=llm_base_url)
     for sub_url in subpage_urls:
         if _is_domain_blocked(sub_url):
             continue
@@ -289,9 +329,9 @@ def scrape_listing_deep(url: str, max_subpages: int = 3) -> Optional[str]:
         sub_text = _extract_page_text(sub_html)
         if sub_text and len(sub_text) > 100:
             _scrape_log(sub_url, "SUB-OK", f"{len(sub_text)} chars")
-            parts.append(sub_text[:1500])
+            sections.append(f"=== Sub-page ({sub_url}) ===\n{sub_text[:1500]}")
 
-    combined = " | ".join(parts)
+    combined = "\n\n".join(sections)
     return combined[:7000]
 
 
@@ -370,23 +410,26 @@ def _scrape_with_playwright(url: str) -> Optional[str]:
         return None
 
 
+# Structural nav paths that are never apartment listings — kept minimal on purpose.
+# Semantic classification (is this a listing page?) is handled by the LLM.
 _NAV_SKIP = {
     "/about", "/contact", "/help", "/faq", "/login", "/signup",
-    "/search", "/blog", "/careers", "/press", "/terms", "/privacy",
-    "/storage", "/campus", "/neighborhood", "/zip-code", "/zip_code",
-    "/news", "/guide", "/trends", "/renters-guide", "/resources",
-    "/sitemap", "/advertise", "/partners",
-}
-
-_LISTING_KEYWORDS = {
-    "apartment", "rent", "lease", "unit", "bed", "bath", "sqft",
-    "homedetail", "rental", "property", "listing",
+    "/blog", "/careers", "/press", "/terms", "/privacy",
+    "/sitemap", "/advertise",
 }
 
 
-def _extract_listing_links(html: str, base_url: str, limit: int = 6) -> list[str]:
+def _extract_listing_links(
+    html: str,
+    base_url: str,
+    limit: int = 6,
+    api_key: str = "",
+    model: str = "",
+    llm_base_url: str = "",
+) -> list[str]:
     """Parse HTML and return up to `limit` individual listing URLs deeper than base_url.
-    Shared by both the Playwright and requests-based harvesters.
+    Uses the LLM to classify links when an API key is available; falls back to
+    returning all structurally valid deeper links.
     """
     try:
         parsed_base = urlparse(base_url)
@@ -394,7 +437,8 @@ def _extract_listing_links(html: str, base_url: str, limit: int = 6) -> list[str
         base_depth = len([p for p in parsed_base.path.rstrip("/").split("/") if p])
 
         soup = BeautifulSoup(html, "lxml")
-        candidates: list[str] = []
+        # (url, anchor_text) pairs — structural pre-filter only
+        candidates: list[tuple[str, str]] = []
         seen: set[str] = set()
 
         for a in soup.find_all("a", href=True):
@@ -420,19 +464,106 @@ def _extract_listing_links(html: str, base_url: str, limit: int = 6) -> list[str
             if norm in seen:
                 continue
             seen.add(norm)
+            candidates.append((href, a.get_text(strip=True)[:100]))
 
-            text_hint = (a.get_text() + path).lower()
-            if any(kw in text_hint for kw in _LISTING_KEYWORDS):
-                candidates.insert(0, href)
-            else:
-                candidates.append(href)
+        if not candidates:
+            return []
 
-        return candidates[:limit]
+        # LLM classification: ask which links are individual listings
+        classified = _llm_classify_links(
+            candidates[:limit * 3],  # send up to 3x the limit for better selection
+            base_url,
+            api_key,
+            model,
+            llm_base_url,
+        )
+        return classified[:limit]
     except Exception:  # noqa: BLE001
         return []
 
 
-def _harvest_links_simple(url: str) -> list[str]:
+def _llm_classify_links(
+    candidates: list[tuple[str, str]],
+    base_url: str,
+    api_key: str,
+    model: str,
+    base_url_str: str = "",
+) -> list[str]:
+    """Ask the LLM to classify a list of (url, anchor_text) pairs harvested from base_url.
+
+    Returns only URLs classified as 'individual_listing'.
+    Falls back to returning all candidates on any failure.
+    """
+    if not api_key or not model or not candidates:
+        return [url for url, _ in candidates]
+    try:
+        from .analyzer import _call_llm, parse_json_response  # noqa: PLC0415
+    except ImportError:
+        return [url for url, _ in candidates]
+
+    lines = "\n".join(
+        f'{i + 1}. {url} | "{text[:80]}"'
+        for i, (url, text) in enumerate(candidates)
+    )
+    prompt = (
+        f"I am harvesting apartment listing URLs from: {base_url}\n\n"
+        "Classify each link as one of:\n"
+        "- individual_listing: a page for exactly one apartment/unit/complex\n"
+        "- list_page: search results or a page listing multiple apartments\n"
+        "- floor_plan: a floor-plan variant sub-page of an already-listed complex\n"
+        "- skip: navigation, contact, blog, login, or unrelated page\n\n"
+        "Links:\n"
+        f"{lines}\n\n"
+        f"Return ONLY a JSON array: "
+        f'[{{"idx":1,"type":"individual_listing"}},{{"idx":2,"type":"skip"}},...]\n'
+        "No explanation."
+    )
+    try:
+        raw = _call_llm(model, prompt, api_key, base_url_str, max_tokens=600)
+        data = parse_json_response(raw)
+        if not isinstance(data, list):
+            return [url for url, _ in candidates]
+        type_map = {item["idx"]: item.get("type", "skip") for item in data if "idx" in item}
+        result = [
+            url for i, (url, _) in enumerate(candidates, 1)
+            if type_map.get(i, "individual_listing") == "individual_listing"
+        ]
+        _scrape_log(base_url, "LLM-LINKS",
+                    f"{len(result)}/{len(candidates)} individual_listing")
+        return result if result else [url for url, _ in candidates]
+    except Exception:  # noqa: BLE001
+        return [url for url, _ in candidates]
+
+
+def _llm_is_list_page(url: str, text_snippet: str, api_key: str, model: str,
+                       base_url_str: str = "") -> bool:
+    """Ask the LLM whether a scraped page is a multi-listing search/results page.
+
+    Returns True (list page) or False (individual listing / unknown).
+    Falls back to False on any failure so listings are never dropped silently.
+    """
+    if not api_key or not model or not text_snippet:
+        return False
+    try:
+        from .analyzer import _call_llm  # noqa: PLC0415
+    except ImportError:
+        return False
+    prompt = (
+        f"URL: {url}\n"
+        f"Page text (first 600 chars):\n{text_snippet[:600]}\n\n"
+        "Is this page an individual apartment listing (single unit or complex), "
+        "or a multi-listing search/results page?\n"
+        "Reply with exactly one word: LISTING or LIST_PAGE"
+    )
+    try:
+        raw = _call_llm(model, prompt, api_key, base_url_str, max_tokens=10).strip().upper()
+        return "LIST_PAGE" in raw
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _harvest_links_simple(url: str, api_key: str = "", model: str = "",
+                           llm_base_url: str = "") -> list[str]:
     """Fetch a non-JS page with requests and return individual listing URLs.
     Used for direct (non-aggregator) results that look like list pages.
     Returns [] on any failure.
@@ -441,7 +572,8 @@ def _harvest_links_simple(url: str) -> list[str]:
         time.sleep(SCRAPE_DELAY)
         resp = requests.get(url, headers=HEADERS, timeout=SCRAPE_TIMEOUT)
         resp.raise_for_status()
-        found = _extract_listing_links(resp.text, url)
+        found = _extract_listing_links(resp.text, url, api_key=api_key,
+                                       model=model, llm_base_url=llm_base_url)
         _scrape_log(url, "HARVEST", f"{len(found)} links (simple)")
         return found
     except Exception:  # noqa: BLE001
@@ -449,22 +581,21 @@ def _harvest_links_simple(url: str) -> list[str]:
 
 
 def _looks_like_list_page(url: str) -> bool:
-    """Heuristic: True if the URL looks like a search-results or list page
-    rather than an individual listing.
+    """Fast structural pre-filter: True if the URL is almost certainly a search/results page.
+    Intentionally minimal — semantic classification is handled by the LLM post-scrape.
     """
     path = urlparse(url).path.lower().rstrip("/")
-    list_patterns = {
-        "/search", "/apartments", "/for-rent", "/rentals", "/listings",
-        "/results", "/find", "/browse", "/homes",
-    }
+    # Only unambiguous aggregator patterns
+    obvious_patterns = {"/search", "/for-rent", "/rentals", "/results"}
     return (
-        any(path == p or path.startswith(p + "/") or path.endswith(p) for p in list_patterns)
-        or path.count("/") <= 1          # very shallow path → likely a category page
-        or "?" in url                    # query-string URLs are usually search results
+        any(path == p or path.startswith(p + "/") for p in obvious_patterns)
+        or path.count("/") <= 1   # very shallow → likely a category/city page
+        or "?" in url             # query-string → almost always a search results URL
     )
 
 
-def _harvest_listing_links(url: str) -> list[str]:
+def _harvest_listing_links(url: str, api_key: str = "", model: str = "",
+                            llm_base_url: str = "") -> list[str]:
     """Render a JS-heavy aggregator page with Playwright and return
     individual listing URLs found on it.  Returns [] on any failure.
     """
@@ -505,7 +636,8 @@ def _harvest_listing_links(url: str) -> list[str]:
     if not html:
         return []
 
-    found = _extract_listing_links(html, url)
+    found = _extract_listing_links(html, url, api_key=api_key, model=model,
+                                    llm_base_url=llm_base_url)
     _scrape_log(url, "HARVEST", f"{len(found)} links extracted")
     return found
 
@@ -531,6 +663,8 @@ def _build_queries(
         f"{city.strip() + ' ' if city.strip() else ''}apartment rentals {beds_str} annual lease",
         f"craigslist{loc} apartments rent {beds_str}",
         f"rentals.com{loc} apartments {beds_str}",
+        f"site:apartments.com{loc} {beds_str} {price_str}",
+        f"{city.strip() + ' ' if city.strip() else ''}property management rentals {beds_str} available now",
     ]
 
 
@@ -566,7 +700,7 @@ def _llm_classify_and_expand(
     if progress_callback:
         progress_callback(0.38, "AI is identifying individual listing URLs...")
 
-    sample = results[:30]  # keep prompt size reasonable
+    sample = results[:50]  # keep prompt size reasonable
     lines = []
     for i, r in enumerate(sample, 1):
         lines.append(
@@ -634,7 +768,7 @@ def _llm_classify_and_expand(
             try:
                 if progress_callback:
                     progress_callback(0.40, f"AI follow-up: {query[:70]}...")
-                new = _ddg_search(query, max_results=8)
+                new = _ddg_search(query, max_results=15)
                 # Drop short-term domains and obviously foreign results
                 new = [
                     r for r in new
@@ -655,9 +789,7 @@ def _llm_classify_and_expand(
             except Exception:  # noqa: BLE001
                 pass
 
-        # Any results beyond the LLM sample pass through unchanged
-        remainder = results[30:]
-        combined = _deduplicate(individual + follow_up_results + remainder)
+        combined = _deduplicate(individual + follow_up_results)
         return combined if combined else results
 
     except Exception as exc:  # noqa: BLE001
@@ -735,7 +867,8 @@ def search_listings(
             continue
         if progress_callback:
             progress_callback(0.3, f"Harvesting links from {urlparse(agg_url).netloc}...")
-        links = _harvest_listing_links(agg_url)
+        links = _harvest_listing_links(agg_url, api_key=api_key, model=model,
+                                        llm_base_url=base_url)
         for link in links:
             harvested.append({
                 "title": agg.get("title", ""),
@@ -750,7 +883,8 @@ def search_listings(
         if result_url and _looks_like_list_page(result_url):
             if progress_callback:
                 progress_callback(0.35, f"Harvesting links from {urlparse(result_url).netloc}...")
-            links = _harvest_links_simple(result_url)
+            links = _harvest_links_simple(result_url, api_key=api_key, model=model,
+                                           llm_base_url=base_url)
             if links:
                 for link in links:
                     harvested.append({
@@ -775,7 +909,9 @@ def search_listings(
             if is_js_heavy(url):
                 listing["page_text"] = _scrape_with_playwright(url)
             else:
-                listing["page_text"] = scrape_listing_deep(url)
+                listing["page_text"] = scrape_listing_deep(
+                    url, api_key=api_key, model=model, llm_base_url=base_url
+                )
                 # Fallback to Playwright if requests got nothing useful
                 if not listing["page_text"]:
                     listing["page_text"] = _scrape_with_playwright(url)
@@ -790,4 +926,61 @@ def search_listings(
             status = "scraped" if listing["scraped"] else "snippet only"
             progress_callback(frac, f"Scraped {i + 1}/{total} ({status})...")
 
-    return listings
+    # ---- Phase 3: re-harvest list pages that slipped through ----
+    # Some pages look like individual listings by URL but are actually
+    # search-result / floor-plan list pages.  Detect them by content and
+    # harvest individual links instead of passing them to extraction.
+    keep: list[dict] = []
+    extra: list[dict] = []
+    re_harvest_budget = 5  # cap extra fetches to avoid long delays
+
+    for listing in listings:
+        page_text = listing.get("page_text")
+        url = listing.get("href", "")
+        if (
+            page_text
+            and url
+            and not is_js_heavy(url)
+            and re_harvest_budget > 0
+            and _llm_is_list_page(url, page_text, api_key, model, base_url)
+        ):
+            _scrape_log(url, "LIST-REHARV", "LLM detected list page — re-harvesting")
+            links = _harvest_links_simple(url, api_key=api_key, model=model,
+                                           llm_base_url=base_url)
+            if links:
+                re_harvest_budget -= 1
+                for link in links:
+                    extra.append({
+                        "title": listing.get("title", ""),
+                        "href":  link,
+                        "body":  listing.get("body", ""),
+                    })
+                continue  # drop the list page itself
+        keep.append(listing)
+
+    # Deduplicate and scrape any newly harvested individual links
+    existing_hrefs = {lst.get("href", "").rstrip("/").lower() for lst in keep}
+    extra = [e for e in _deduplicate(extra)
+             if e["href"].rstrip("/").lower() not in existing_hrefs]
+
+    for listing in extra:
+        url = listing.get("href", "")
+        if url:
+            if is_js_heavy(url):
+                listing["page_text"] = _scrape_with_playwright(url)
+            else:
+                listing["page_text"] = scrape_listing_deep(
+                    url, api_key=api_key, model=model, llm_base_url=base_url
+                )
+                if not listing["page_text"]:
+                    listing["page_text"] = _scrape_with_playwright(url)
+            listing["scraped"] = listing["page_text"] is not None
+        else:
+            listing["page_text"] = None
+            listing["scraped"] = False
+
+    if extra:
+        _scrape_log("--- PHASE-3 ---", "INFO",
+                    f"{len(extra)} individual listings harvested from list pages")
+
+    return _deduplicate(keep + extra)

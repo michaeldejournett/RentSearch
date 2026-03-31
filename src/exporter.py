@@ -11,7 +11,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from .geocode import compute_weighted_distance, compute_distance_score
+from .geocode import compute_weighted_distance, compute_distance_score, is_too_far
 
 
 def _parse_price(raw) -> Optional[float]:
@@ -75,18 +75,23 @@ def build_dataframe(
         ext = listing.get("extracted") or {}
         scoring = listing.get("scoring") or {}
 
-        # --- minimum data check — skip entirely empty extractions ---
+        # --- minimum data check — skip listings with no extraction data at all ---
         price_raw = _parse_price(ext.get("price_monthly"))
         bedrooms_raw = ext.get("bedrooms")
         address_raw = ext.get("address")
-        if price_raw is None and bedrooms_raw is None and not address_raw:
+        summary_raw = scoring.get("overall_summary", "")
+        has_structured = price_raw is not None or bedrooms_raw is not None or address_raw
+        has_summary = bool(summary_raw and summary_raw.strip())
+        if not has_structured and not has_summary:
             continue
 
         address = address_raw or "—"
         apt_coords = listing.get("apt_coords")
 
-        # distance — soft scoring only, no hard cut-off
+        # Distance: hard-filter if coords available and listing exceeds every location's max
         if apt_coords and locations:
+            if is_too_far(apt_coords, locations):
+                continue
             dist_info = compute_weighted_distance(apt_coords, locations)
             per_loc = dist_info["per_location"]
             dist_score = compute_distance_score(apt_coords, locations)

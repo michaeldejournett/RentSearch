@@ -7,8 +7,9 @@ from typing import Optional
 
 import flet as ft
 
-from src.analyzer import analyze_listings_batch
+from src.analyzer import analyze_listings_batch, filter_irrelevant_listings
 from src.config import has_api_key, load_config
+from src.runs import save_run
 from src.search import search_listings
 from src import state
 
@@ -16,8 +17,12 @@ from src import state
 BATH_OPTIONS = ["Any", "1", "1.5", "2", "2.5", "3", "3+"]
 
 
-def search_page(page: ft.Page) -> ft.Column:
+def search_page(page: ft.Page, prefill: dict = None) -> ft.Column:
     cfg = load_config()
+    # A prefill dict (from a saved run) overrides config defaults.
+    pf_params = (prefill or {}).get("params", {})
+    pf_locations = (prefill or {}).get("locations", [])
+    pf_criteria = (prefill or {}).get("criteria", [])
 
     # ------------------------------------------------------------------ state
     locations: list[dict] = []   # [{label, address, weight, coords}]
@@ -26,35 +31,35 @@ def search_page(page: ft.Page) -> ft.Column:
     locations_col = ft.Column(spacing=8)
     criteria_col = ft.Column(spacing=8)
 
-    # Search params
+    # Search params — prefill values override config defaults
     city_field = ft.TextField(
         label="City / Area to search (optional)",
         hint_text="e.g. Denver, CO — leave blank to search nationally",
-        value=cfg.get("default_city", ""),
+        value=pf_params.get("city", cfg.get("default_city", "")),
         expand=True,
     )
     min_price_field = ft.TextField(
         label="Min price ($/mo)",
-        value=str(cfg.get("default_min_price", 1000)),
+        value=str(pf_params.get("min_price", cfg.get("default_min_price", 1000))),
         keyboard_type=ft.KeyboardType.NUMBER,
         width=150,
     )
     max_price_field = ft.TextField(
         label="Max price ($/mo)",
-        value=str(cfg.get("default_max_price", 3000)),
+        value=str(pf_params.get("max_price", cfg.get("default_max_price", 3000))),
         keyboard_type=ft.KeyboardType.NUMBER,
         width=150,
     )
     min_beds_dd = ft.Dropdown(
         label="Min beds",
         options=[ft.dropdown.Option(str(i), "Studio" if i == 0 else str(i)) for i in range(6)],
-        value=str(cfg.get("default_min_beds", 1)),
+        value=str(pf_params.get("min_beds", cfg.get("default_min_beds", 1))),
         width=110,
     )
     max_beds_dd = ft.Dropdown(
         label="Max beds",
         options=[ft.dropdown.Option(str(i), "Studio" if i == 0 else str(i)) for i in range(6)],
-        value=str(cfg.get("default_max_beds", 3)),
+        value=str(pf_params.get("max_beds", cfg.get("default_max_beds", 3))),
         width=110,
     )
     min_baths_dd = ft.Dropdown(
@@ -69,6 +74,18 @@ def search_page(page: ft.Page) -> ft.Column:
         value="Any",
         width=110,
     )
+
+    # Seed locations/criteria from prefill (strip coords so they get re-geocoded)
+    for loc in pf_locations:
+        locations.append({
+            "label": loc.get("label", ""),
+            "address": loc.get("address", ""),
+            "weight": loc.get("weight", 5),
+            "max_distance": loc.get("max_distance", 15),
+            "coords": None,  # will be re-geocoded on search
+        })
+    for crit in pf_criteria:
+        criteria.append({"text": crit.get("text", ""), "weight": crit.get("weight", 5)})
 
     error_text = ft.Text("", color=ft.Colors.RED_600, size=13, visible=False)
 
@@ -504,6 +521,12 @@ def search_page(page: ft.Page) -> ft.Column:
                 page.run_task(_nav_no_results)
                 return
 
+            listings = filter_irrelevant_listings(
+                listings, city, min_price, max_price, min_beds, max_beds,
+                api_key=api_key, model=model, base_url=base_url,
+                progress_callback=_set_progress,
+            )
+
             listings = analyze_listings_batch(
                 listings, effective_criteria, api_key,
                 progress_callback=_set_progress,
@@ -531,6 +554,24 @@ def search_page(page: ft.Page) -> ft.Column:
                     fn("/results")
             page.run_task(_nav_error)
             return
+
+        # Auto-save this run to history
+        try:
+            save_run(
+                city=city,
+                min_price=min_price,
+                max_price=max_price,
+                min_beds=min_beds,
+                max_beds=max_beds,
+                min_baths=min_baths,
+                max_baths=max_baths,
+                locations=list(locations),
+                criteria=effective_criteria,
+                listings=listings,
+                listing_names=state.get("listing_names"),
+            )
+        except Exception:  # noqa: BLE001
+            pass  # never let a save failure break the search result
 
         state.set("search_results", listings)
         state.set("search_locations", list(locations))
@@ -582,7 +623,7 @@ def search_page(page: ft.Page) -> ft.Column:
     )
 
     # ------------------------------------------------------------------- UI
-    return ft.Column(
+    column_content = ft.Column(
         controls=[
             ft.Text("Find Your Apartment", size=26, weight=ft.FontWeight.BOLD),
             ft.Divider(),
@@ -643,3 +684,13 @@ def search_page(page: ft.Page) -> ft.Column:
         spacing=14,
         scroll=ft.ScrollMode.AUTO,
     )
+
+    # If a re-run was requested from History, auto-start the search once rendered
+    if state.get("search_autostart"):
+        state.set("search_autostart", False)
+        async def _auto_start():
+            start_search(None)
+        page.run_task(_auto_start)
+
+    return column_content
+

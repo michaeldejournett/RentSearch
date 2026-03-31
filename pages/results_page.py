@@ -40,7 +40,7 @@ def results_page(page: ft.Page) -> ft.Column:
             ),
             loading_bar,
             loading_label,
-        ], spacing=16)
+        ], spacing=16, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
 
     # ---------------------------------------------------------------- error
     err = state.get("search_error")
